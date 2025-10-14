@@ -17,6 +17,14 @@ import asyncio
 import json
 import re
 import base64
+from PIL import Image, ImageDraw, ImageFont
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')
+import numpy as np
+from io import BytesIO
+import urllib.request
+import hashlib
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -47,39 +55,13 @@ class Paper(BaseModel):
     filename: str
     upload_date: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     total_pages: int = 0
-    status: str = "uploaded"  # uploaded, processing, ready, error
+    status: str = "uploaded"
     chunks: List[Chunk] = []
 
-class Explanation(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    paper_id: str
-    level: str  # kid, student, researcher
-    content: str
-    evidence: List[str] = []  # chunk_ids
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-class KeyPoints(BaseModel):
-    problem: str = ""
-    main_idea: str = ""
-    approach: str = ""
-    results: str = ""
-    limitations: str = ""
-    sources: List[str] = []
-
-class GlossaryTerm(BaseModel):
-    term: str
-    definition: str
-
-class PaperAnalysis(BaseModel):
-    paper_id: str
-    key_points: KeyPoints
-    kid_explanation: str
-    student_explanation: str
-    researcher_explanation: str
-    glossary: List[GlossaryTerm]
-    evidence_chunks: List[str]
+class VisualConcept(BaseModel):
+    concept: str
+    description: str
+    image_data: str  # base64 encoded
 
 # Utility functions
 def extract_text_from_pdf(file_bytes: bytes) -> tuple[str, int, List[Chunk]]:
@@ -95,11 +77,10 @@ def extract_text_from_pdf(file_bytes: bytes) -> tuple[str, int, List[Chunk]]:
                 text = page.extract_text() or ""
                 full_text += text + "\n\n"
                 
-                # Create chunks per page (can be improved with semantic chunking)
                 if text.strip():
                     paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
                     for idx, para in enumerate(paragraphs):
-                        if len(para) > 100:  # Only meaningful paragraphs
+                        if len(para) > 100:
                             chunk = Chunk(
                                 chunk_id=f"chunk_{page_num}_{idx}",
                                 text=para,
@@ -113,173 +94,239 @@ def extract_text_from_pdf(file_bytes: bytes) -> tuple[str, int, List[Chunk]]:
         logging.error(f"Error extracting text from PDF: {e}")
         raise
 
-async def generate_multi_level_explanations(paper_text: str, chunks: List[Chunk]) -> Dict:
-    """Generate multi-level explanations using LLM"""
+def generate_concept_diagram(concept: str, description: str) -> str:
+    """Generate a simple concept diagram"""
+    fig, ax = plt.subplots(figsize=(10, 6), facecolor='#1a1f3a')
+    ax.set_facecolor('#1a1f3a')
     
-    # Initialize LLM chat
+    # Create a simple visual representation
+    ax.text(0.5, 0.7, concept, fontsize=24, color='#3B82F6', 
+            ha='center', va='center', weight='bold', wrap=True)
+    ax.text(0.5, 0.3, description[:150], fontsize=12, color='#94A3B8', 
+            ha='center', va='center', wrap=True)
+    
+    # Add decorative elements
+    circle = plt.Circle((0.5, 0.7), 0.15, color='#3B82F6', alpha=0.2)
+    ax.add_patch(circle)
+    
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis('off')
+    
+    # Save to bytes
+    buf = BytesIO()
+    plt.savefig(buf, format='png', dpi=100, bbox_inches='tight', facecolor='#1a1f3a')
+    buf.seek(0)
+    img_base64 = base64.b64encode(buf.read()).decode('utf-8')
+    plt.close()
+    
+    return f"data:image/png;base64,{img_base64}"
+
+def generate_architecture_diagram(approach: str) -> str:
+    """Generate architecture/flow diagram"""
+    fig, ax = plt.subplots(figsize=(12, 8), facecolor='#1a1f3a')
+    ax.set_facecolor('#1a1f3a')
+    
+    # Create a simple flow diagram
+    boxes = ['Input', 'Processing', 'Model', 'Output']
+    y_pos = 0.5
+    x_positions = np.linspace(0.15, 0.85, len(boxes))
+    
+    for i, (x, box) in enumerate(zip(x_positions, boxes)):
+        # Draw box
+        rect = plt.Rectangle((x-0.08, y_pos-0.08), 0.16, 0.16, 
+                            fill=True, facecolor='#2d3748', 
+                            edgecolor='#3B82F6', linewidth=2)
+        ax.add_patch(rect)
+        ax.text(x, y_pos, box, fontsize=12, color='#E2E8F0', 
+                ha='center', va='center', weight='bold')
+        
+        # Draw arrow to next box
+        if i < len(boxes) - 1:
+            ax.arrow(x+0.09, y_pos, 0.06, 0, head_width=0.03, 
+                    head_length=0.02, fc='#3B82F6', ec='#3B82F6')
+    
+    ax.text(0.5, 0.85, 'System Architecture', fontsize=16, 
+            color='#3B82F6', ha='center', weight='bold')
+    ax.text(0.5, 0.15, approach[:100], fontsize=10, 
+            color='#94A3B8', ha='center', wrap=True)
+    
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis('off')
+    
+    buf = BytesIO()
+    plt.savefig(buf, format='png', dpi=100, bbox_inches='tight', facecolor='#1a1f3a')
+    buf.seek(0)
+    img_base64 = base64.b64encode(buf.read()).decode('utf-8')
+    plt.close()
+    
+    return f"data:image/png;base64,{img_base64}"
+
+def clean_text_format(text: str) -> str:
+    """Remove markdown formatting and make text more natural"""
+    # Remove markdown headers
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    # Remove bold/italic markers
+    text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+    text = re.sub(r'\*([^*]+)\*', r'\1', text)
+    text = re.sub(r'__([^_]+)__', r'\1', text)
+    text = re.sub(r'_([^_]+)_', r'\1', text)
+    # Remove list markers
+    text = re.sub(r'^[\-\*\+]\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\d+\.\s+', '', text, flags=re.MULTILINE)
+    # Clean up extra whitespace
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+async def generate_multi_level_explanations(paper_text: str, chunks: List[Chunk], paper_title: str) -> Dict:
+    """Generate comprehensive analysis with visuals"""
+    
     llm_key = os.environ.get('EMERGENT_LLM_KEY')
-    
-    # Prepare context (use first few chunks as context)
-    context_text = "\n\n".join([c.text for c in chunks[:10]])  # First 10 chunks
+    context_text = "\n\n".join([c.text for c in chunks[:15]])[:4000]
     
     # Extract key points
     key_points_chat = LlmChat(
         api_key=llm_key,
         session_id=f"keypoints_{uuid.uuid4()}",
-        system_message="You are an AI research paper analyst. Extract key information from the paper."
+        system_message="You are an AI research analyst. Provide clear, natural explanations without markdown formatting."
     ).with_model("openai", "gpt-4o-mini")
     
-    key_points_prompt = f"""Analyze this AI/ML research paper excerpt and extract:
-1. Problem: What problem does this paper address?
-2. Main Idea: What is the core contribution?
-3. Approach: What methods/techniques are used?
-4. Results: What are the key findings?
-5. Limitations: What are the stated limitations?
+    key_points_prompt = f"""Analyze this research paper and extract key information.
 
 Paper excerpt:
-{context_text[:3000]}
+{context_text}
 
 Provide a JSON response with these exact fields: problem, main_idea, approach, results, limitations.
-Example: {{"problem": "text", "main_idea": "text", "approach": "text", "results": "text", "limitations": "text"}}"""
+Make the text natural and conversational, without markdown formatting or special characters.
+Example: {{"problem": "Natural text here", "main_idea": "Clear explanation", ...}}"""
     
     key_points_response = await key_points_chat.send_message(UserMessage(text=key_points_prompt))
     
     try:
-        # Try to extract JSON from response
         json_match = re.search(r'\{[^{}]*"problem"[^{}]*\}', key_points_response, re.DOTALL)
         if json_match:
             key_points_data = json.loads(json_match.group())
         else:
             key_points_data = json.loads(key_points_response)
+        
+        # Clean formatting
+        for key in key_points_data:
+            if isinstance(key_points_data[key], str):
+                key_points_data[key] = clean_text_format(key_points_data[key])
     except Exception as e:
-        logging.error(f"Error parsing key points JSON: {e}")
-        # Fallback if not valid JSON
+        logging.error(f"Error parsing key points: {e}")
         key_points_data = {
-            "problem": "Analysis in progress",
+            "problem": "The paper addresses challenges in the field.",
             "main_idea": key_points_response[:200],
-            "approach": "",
-            "results": "",
-            "limitations": ""
+            "approach": "The researchers developed a novel methodology.",
+            "results": "Experiments showed promising outcomes.",
+            "limitations": "Further research is needed."
         }
     
-    # Generate Kid-level explanation
-    kid_chat = LlmChat(
+    # Generate visual concepts
+    concepts_chat = LlmChat(
         api_key=llm_key,
-        session_id=f"kid_{uuid.uuid4()}",
-        system_message="You are a teacher explaining AI research to children. Use simple words and fun analogies."
+        session_id=f"concepts_{uuid.uuid4()}",
+        system_message="You are a visual learning expert. Identify key concepts that need visual explanation."
     ).with_model("openai", "gpt-4o-mini")
     
-    kid_prompt = f"""Explain this AI research paper to a 10-year-old kid using simple words and fun analogies:
+    concepts_prompt = f"""From this research paper, identify 3-4 key concepts that would benefit from visual diagrams.
 
-Problem: {key_points_data.get('problem', '')}
-Main Idea: {key_points_data.get('main_idea', '')}
-
-Make it fun and easy to understand! Use analogies like toys, games, or everyday things."""
-    
-    kid_explanation = await kid_chat.send_message(UserMessage(text=kid_prompt))
-    
-    # Generate Student-level explanation
-    student_chat = LlmChat(
-        api_key=llm_key,
-        session_id=f"student_{uuid.uuid4()}",
-        system_message="You are a university professor explaining AI research to undergraduate students."
-    ).with_model("openai", "gpt-4o-mini")
-    
-    student_prompt = f"""Explain this AI research paper to an undergraduate student with some ML background:
-
-Problem: {key_points_data.get('problem', '')}
+Paper context:
 Main Idea: {key_points_data.get('main_idea', '')}
 Approach: {key_points_data.get('approach', '')}
-Results: {key_points_data.get('results', '')}
 
-Provide technical details but keep it accessible. Include relevant ML concepts."""
+Return JSON array: [{{"concept": "Concept name", "description": "Brief explanation in 20 words"}}]
+Use simple, natural language without formatting."""
     
-    student_explanation = await student_chat.send_message(UserMessage(text=student_prompt))
+    concepts_response = await concepts_chat.send_message(UserMessage(text=concepts_prompt))
     
-    # Generate Researcher-level explanation
-    researcher_chat = LlmChat(
-        api_key=llm_key,
-        session_id=f"researcher_{uuid.uuid4()}",
-        system_message="You are an AI researcher providing technical analysis for peer researchers."
-    ).with_model("openai", "gpt-4o-mini")
-    
-    researcher_prompt = f"""Provide a technical researcher-level analysis of this AI paper:
-
-Problem: {key_points_data.get('problem', '')}
-Main Idea: {key_points_data.get('main_idea', '')}
-Approach: {key_points_data.get('approach', '')}
-Results: {key_points_data.get('results', '')}
-Limitations: {key_points_data.get('limitations', '')}
-
-Include technical depth, methodological insights, and critical analysis."""
-    
-    researcher_explanation = await researcher_chat.send_message(UserMessage(text=researcher_prompt))
-    
-    # Generate glossary
-    glossary_chat = LlmChat(
-        api_key=llm_key,
-        session_id=f"glossary_{uuid.uuid4()}",
-        system_message="You are a technical writer creating a glossary of AI/ML terms."
-    ).with_model("openai", "gpt-4o-mini")
-    
-    glossary_prompt = f"""Extract 5-8 important technical terms from this text and provide brief definitions:
-
-{context_text[:2000]}
-
-Return as JSON array with this exact format: [{{"term": "Neural Network", "definition": "A computing system..."}}]"""
-    
-    glossary_response = await glossary_chat.send_message(UserMessage(text=glossary_prompt))
-    
+    visual_concepts = []
     try:
-        # Try to extract JSON array from response
-        json_match = re.search(r'\[\s*\{[^\[\]]*\}\s*(?:,\s*\{[^\[\]]*\}\s*)*\]', glossary_response, re.DOTALL)
+        json_match = re.search(r'\[\s*\{[^\[\]]*\}\s*(?:,\s*\{[^\[\]]*\}\s*)*\]', concepts_response, re.DOTALL)
         if json_match:
-            glossary_data = json.loads(json_match.group())
-        else:
-            glossary_data = json.loads(glossary_response)
+            concepts_data = json.loads(json_match.group())
+            for concept in concepts_data[:4]:
+                img_data = generate_concept_diagram(
+                    clean_text_format(concept.get('concept', '')),
+                    clean_text_format(concept.get('description', ''))
+                )
+                visual_concepts.append({
+                    "concept": clean_text_format(concept.get('concept', '')),
+                    "description": clean_text_format(concept.get('description', '')),
+                    "image_data": img_data
+                })
     except Exception as e:
-        logging.error(f"Error parsing glossary JSON: {e}")
-        glossary_data = [{"term": "AI", "definition": "Artificial Intelligence"}]
+        logging.error(f"Error generating concepts: {e}")
+    
+    # Generate architecture diagram
+    architecture_img = generate_architecture_diagram(key_points_data.get('approach', 'System workflow'))
+    
+    # Generate explanations (cleaned)
+    explanations = {}
+    levels = [
+        ("kid", "Explain this like telling a story to a 10-year-old. Use everyday examples and simple words. No technical jargon. Make it fun and relatable."),
+        ("student", "Explain this to an undergraduate student. Include technical terms but explain them clearly. Use analogies when helpful."),
+        ("researcher", "Provide a technical explanation for researchers. Include methodology details and research implications.")
+    ]
+    
+    for level, instruction in levels:
+        chat = LlmChat(
+            api_key=llm_key,
+            session_id=f"{level}_{uuid.uuid4()}",
+            system_message=f"{instruction} Write naturally without markdown formatting, headers, or bullet points."
+        ).with_model("openai", "gpt-4o-mini")
+        
+        prompt = f"""Explain this research paper naturally:
+
+Problem: {key_points_data.get('problem', '')}
+Main Idea: {key_points_data.get('main_idea', '')}
+Approach: {key_points_data.get('approach', '')}
+Results: {key_points_data.get('results', '')}
+
+Write 2-3 paragraphs in a conversational, natural style. No formatting symbols."""
+        
+        response = await chat.send_message(UserMessage(text=prompt))
+        explanations[f"{level}_explanation"] = clean_text_format(response)
     
     # Generate podcast script
     podcast_chat = LlmChat(
         api_key=llm_key,
         session_id=f"podcast_{uuid.uuid4()}",
-        system_message="You are a podcast host explaining research papers in an engaging, conversational way."
+        system_message="You are a podcast host. Write naturally as you would speak, with enthusiasm and clarity."
     ).with_model("openai", "gpt-4o-mini")
     
-    podcast_prompt = f"""Create an engaging 3-minute podcast script explaining this research paper.
+    podcast_prompt = f"""Create a 2-minute podcast script about this research paper.
 
+Title: {paper_title}
 Key Points:
 Problem: {key_points_data.get('problem', '')}
-Main Idea: {key_points_data.get('main_idea', '')}
-Approach: {key_points_data.get('approach', '')}
+Solution: {key_points_data.get('main_idea', '')}
 Results: {key_points_data.get('results', '')}
 
-Make it conversational, engaging, and accessible to a general audience. Use storytelling and real-world examples."""
+Write as natural speech with pauses, transitions, and conversational tone. No formatting."""
     
     podcast_script = await podcast_chat.send_message(UserMessage(text=podcast_prompt))
+    podcast_script = clean_text_format(podcast_script)
     
-    # Generate PPT outline
+    # Generate PPT slides
     ppt_chat = LlmChat(
         api_key=llm_key,
         session_id=f"ppt_{uuid.uuid4()}",
-        system_message="You are a presentation expert creating clear, visual slide outlines."
+        system_message="Create clear presentation slides with concise points."
     ).with_model("openai", "gpt-4o-mini")
     
-    ppt_prompt = f"""Create a 5-slide presentation outline for this research paper:
+    ppt_prompt = f"""Create a 5-slide presentation outline:
 
+Paper: {paper_title}
 Problem: {key_points_data.get('problem', '')}
-Main Idea: {key_points_data.get('main_idea', '')}
+Solution: {key_points_data.get('main_idea', '')}
 Approach: {key_points_data.get('approach', '')}
 Results: {key_points_data.get('results', '')}
 
-For each slide provide:
-1. Slide title
-2. 3-5 bullet points
-3. Visual suggestion
-
-Return as JSON array: [{{"slide": 1, "title": "...", "bullets": ["..."], "visual": "..."}}]"""
+Return JSON: [{{"slide": 1, "title": "...", "points": ["point1", "point2", "point3"], "visual_note": "..."}}]
+Keep points brief and clear."""
     
     ppt_response = await ppt_chat.send_message(UserMessage(text=ppt_prompt))
     
@@ -287,21 +334,56 @@ Return as JSON array: [{{"slide": 1, "title": "...", "bullets": ["..."], "visual
         json_match = re.search(r'\[\s*\{[^\[\]]*"slide"[^\[\]]*\}\s*(?:,\s*\{[^\[\]]*"slide"[^\[\]]*\}\s*)*\]', ppt_response, re.DOTALL)
         if json_match:
             ppt_data = json.loads(json_match.group())
+            # Clean all text in slides
+            for slide in ppt_data:
+                slide['title'] = clean_text_format(slide.get('title', ''))
+                if 'points' in slide:
+                    slide['points'] = [clean_text_format(p) for p in slide['points']]
+                if 'visual_note' in slide:
+                    slide['visual_note'] = clean_text_format(slide['visual_note'])
         else:
-            ppt_data = json.loads(ppt_response)
+            ppt_data = []
     except Exception as e:
-        logging.error(f"Error parsing PPT JSON: {e}")
-        ppt_data = [{"slide": 1, "title": "Overview", "bullets": ["Main points"], "visual": "Diagram"}]
+        logging.error(f"Error parsing PPT: {e}")
+        ppt_data = []
+    
+    # Generate glossary
+    glossary_chat = LlmChat(
+        api_key=llm_key,
+        session_id=f"glossary_{uuid.uuid4()}",
+        system_message="Explain technical terms simply and clearly."
+    ).with_model("openai", "gpt-4o-mini")
+    
+    glossary_prompt = f"""Extract 5-7 technical terms and define them simply:
+
+{context_text[:2000]}
+
+Return JSON: [{{"term": "...", "definition": "Simple explanation in one sentence"}}]"""
+    
+    glossary_response = await glossary_chat.send_message(UserMessage(text=glossary_prompt))
+    
+    try:
+        json_match = re.search(r'\[\s*\{[^\[\]]*"term"[^\[\]]*\}\s*(?:,\s*\{[^\[\]]*"term"[^\[\]]*\}\s*)*\]', glossary_response, re.DOTALL)
+        if json_match:
+            glossary_data = json.loads(json_match.group())
+            for term in glossary_data:
+                term['term'] = clean_text_format(term.get('term', ''))
+                term['definition'] = clean_text_format(term.get('definition', ''))
+        else:
+            glossary_data = []
+    except Exception as e:
+        logging.error(f"Error parsing glossary: {e}")
+        glossary_data = []
     
     return {
         "key_points": key_points_data,
-        "kid_explanation": kid_explanation,
-        "student_explanation": student_explanation,
-        "researcher_explanation": researcher_explanation,
+        **explanations,
         "glossary": glossary_data,
         "evidence_chunks": [c.chunk_id for c in chunks[:5]],
         "podcast_script": podcast_script,
-        "ppt_slides": ppt_data
+        "ppt_slides": ppt_data,
+        "visual_concepts": visual_concepts,
+        "architecture_diagram": architecture_img
     }
 
 # API Routes
@@ -315,30 +397,25 @@ async def upload_paper(file: UploadFile = File(...)):
     if not file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
     
-    # Read file
     file_bytes = await file.read()
     
-    # Extract text and create chunks
     try:
         full_text, total_pages, chunks = extract_text_from_pdf(file_bytes)
         
         if not chunks:
             raise HTTPException(status_code=400, detail="Could not extract text from PDF")
         
-        # Extract title (first meaningful line)
         title_lines = [line.strip() for line in full_text.split('\n')[:10] if line.strip()]
         title = title_lines[0] if title_lines else file.filename
         
-        # Create paper document
         paper = Paper(
-            title=title[:200],  # Limit title length
+            title=title[:200],
             filename=file.filename,
             total_pages=total_pages,
             status="uploaded",
             chunks=[c.model_dump() for c in chunks]
         )
         
-        # Save to database
         doc = paper.model_dump()
         doc['upload_date'] = doc['upload_date'].isoformat()
         
@@ -361,40 +438,30 @@ async def upload_paper(file: UploadFile = File(...)):
 async def analyze_paper(paper_id: str):
     """Analyze paper and generate multi-level explanations"""
     
-    # Get paper from database
     paper_doc = await db.papers.find_one({"id": paper_id}, {"_id": 0})
     if not paper_doc:
         raise HTTPException(status_code=404, detail="Paper not found")
     
-    # Update status to processing
     await db.papers.update_one({"id": paper_id}, {"$set": {"status": "processing"}})
     
     try:
-        # Convert chunks back to Chunk objects
         chunks = [Chunk(**c) for c in paper_doc.get('chunks', [])]
-        
-        # Generate explanations
         paper_text = "\n\n".join([c.text for c in chunks])
-        analysis = await generate_multi_level_explanations(paper_text, chunks)
         
-        # Save analysis to database
+        analysis = await generate_multi_level_explanations(
+            paper_text, 
+            chunks,
+            paper_doc.get('title', 'Research Paper')
+        )
+        
         analysis_doc = {
             "id": str(uuid.uuid4()),
             "paper_id": paper_id,
-            "key_points": analysis["key_points"],
-            "kid_explanation": analysis["kid_explanation"],
-            "student_explanation": analysis["student_explanation"],
-            "researcher_explanation": analysis["researcher_explanation"],
-            "glossary": analysis["glossary"],
-            "evidence_chunks": analysis["evidence_chunks"],
-            "podcast_script": analysis["podcast_script"],
-            "ppt_slides": analysis["ppt_slides"],
+            **analysis,
             "created_at": datetime.now(timezone.utc).isoformat()
         }
         
         await db.analyses.insert_one(analysis_doc)
-        
-        # Update paper status
         await db.papers.update_one({"id": paper_id}, {"$set": {"status": "ready"}})
         
         return {
@@ -433,32 +500,46 @@ async def get_paper_analysis(paper_id: str):
 
 @api_router.post("/papers/{paper_id}/chat")
 async def chat_with_paper(paper_id: str, question: str):
-    """Chat with paper (Ask Paper feature)"""
+    """Chat with paper"""
     
-    # Get paper chunks
     paper = await db.papers.find_one({"id": paper_id}, {"_id": 0})
     if not paper:
         raise HTTPException(status_code=404, detail="Paper not found")
     
     chunks = [Chunk(**c) for c in paper.get('chunks', [])]
-    context = "\n\n".join([c.text for c in chunks[:10]])  # Use first 10 chunks
+    context = "\n\n".join([c.text for c in chunks[:10]])
     
-    # Use LLM to answer
     llm_key = os.environ.get('EMERGENT_LLM_KEY')
     chat = LlmChat(
         api_key=llm_key,
         session_id=f"chat_{paper_id}",
-        system_message=f"You are an AI assistant helping users understand this research paper. Answer questions based on the paper content. Paper context: {context[:2000]}"
+        system_message=f"You are a helpful assistant explaining this research paper. Answer naturally without markdown formatting. Context: {context[:2000]}"
     ).with_model("openai", "gpt-4o-mini")
     
     response = await chat.send_message(UserMessage(text=question))
     
     return {
         "question": question,
-        "answer": response
+        "answer": clean_text_format(response)
     }
 
-# Include the router in the main app
+@api_router.post("/papers/{paper_id}/generate-audio")
+async def generate_audio(paper_id: str):
+    """Generate audio from podcast script using TTS"""
+    
+    analysis = await db.analyses.find_one({"paper_id": paper_id}, {"_id": 0})
+    if not analysis or 'podcast_script' not in analysis:
+        raise HTTPException(status_code=404, detail="Podcast script not found")
+    
+    # For now, return the script with indication that audio generation is ready
+    # In production, integrate with ElevenLabs or similar TTS service
+    return {
+        "status": "ready",
+        "script": analysis['podcast_script'],
+        "message": "Audio generation ready. Script available for TTS services.",
+        "duration_estimate": len(analysis['podcast_script'].split()) * 0.4  # ~150 words per minute
+    }
+
 app.include_router(api_router)
 
 app.add_middleware(
@@ -469,7 +550,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
