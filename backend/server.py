@@ -1,4 +1,5 @@
 from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException
+from fastapi.responses import StreamingResponse, FileResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -14,6 +15,8 @@ import pdfplumber
 from emergentintegrations.llm.chat import LlmChat, UserMessage
 import asyncio
 import json
+import re
+import base64
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -84,27 +87,31 @@ def extract_text_from_pdf(file_bytes: bytes) -> tuple[str, int, List[Chunk]]:
     chunks = []
     full_text = ""
     
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        total_pages = len(pdf.pages)
-        
-        for page_num, page in enumerate(pdf.pages, 1):
-            text = page.extract_text() or ""
-            full_text += text + "\n\n"
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            total_pages = len(pdf.pages)
             
-            # Create chunks per page (can be improved with semantic chunking)
-            if text.strip():
-                paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
-                for idx, para in enumerate(paragraphs):
-                    if len(para) > 100:  # Only meaningful paragraphs
-                        chunk = Chunk(
-                            chunk_id=f"chunk_{page_num}_{idx}",
-                            text=para,
-                            page_number=page_num,
-                            section="main"
-                        )
-                        chunks.append(chunk)
-    
-    return full_text, total_pages, chunks
+            for page_num, page in enumerate(pdf.pages, 1):
+                text = page.extract_text() or ""
+                full_text += text + "\n\n"
+                
+                # Create chunks per page (can be improved with semantic chunking)
+                if text.strip():
+                    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+                    for idx, para in enumerate(paragraphs):
+                        if len(para) > 100:  # Only meaningful paragraphs
+                            chunk = Chunk(
+                                chunk_id=f"chunk_{page_num}_{idx}",
+                                text=para,
+                                page_number=page_num,
+                                section="main"
+                            )
+                            chunks.append(chunk)
+        
+        return full_text, total_pages, chunks
+    except Exception as e:
+        logging.error(f"Error extracting text from PDF: {e}")
+        raise
 
 async def generate_multi_level_explanations(paper_text: str, chunks: List[Chunk]) -> Dict:
     """Generate multi-level explanations using LLM"""
@@ -132,14 +139,20 @@ async def generate_multi_level_explanations(paper_text: str, chunks: List[Chunk]
 Paper excerpt:
 {context_text[:3000]}
 
-Provide a structured JSON response with these fields: problem, main_idea, approach, results, limitations."""
+Provide a JSON response with these exact fields: problem, main_idea, approach, results, limitations.
+Example: {{"problem": "text", "main_idea": "text", "approach": "text", "results": "text", "limitations": "text"}}"""
     
     key_points_response = await key_points_chat.send_message(UserMessage(text=key_points_prompt))
     
     try:
-        # Try to parse JSON from response
-        key_points_data = json.loads(key_points_response)
-    except:
+        # Try to extract JSON from response
+        json_match = re.search(r'\{[^{}]*"problem"[^{}]*\}', key_points_response, re.DOTALL)
+        if json_match:
+            key_points_data = json.loads(json_match.group())
+        else:
+            key_points_data = json.loads(key_points_response)
+    except Exception as e:
+        logging.error(f"Error parsing key points JSON: {e}")
         # Fallback if not valid JSON
         key_points_data = {
             "problem": "Analysis in progress",
@@ -213,14 +226,72 @@ Include technical depth, methodological insights, and critical analysis."""
 
 {context_text[:2000]}
 
-Return as JSON array: [{"term": "...", "definition": "..."}]"""
+Return as JSON array with this exact format: [{{"term": "Neural Network", "definition": "A computing system..."}}]"""
     
     glossary_response = await glossary_chat.send_message(UserMessage(text=glossary_prompt))
     
     try:
-        glossary_data = json.loads(glossary_response)
-    except:
+        # Try to extract JSON array from response
+        json_match = re.search(r'\[\s*\{[^\[\]]*\}\s*(?:,\s*\{[^\[\]]*\}\s*)*\]', glossary_response, re.DOTALL)
+        if json_match:
+            glossary_data = json.loads(json_match.group())
+        else:
+            glossary_data = json.loads(glossary_response)
+    except Exception as e:
+        logging.error(f"Error parsing glossary JSON: {e}")
         glossary_data = [{"term": "AI", "definition": "Artificial Intelligence"}]
+    
+    # Generate podcast script
+    podcast_chat = LlmChat(
+        api_key=llm_key,
+        session_id=f"podcast_{uuid.uuid4()}",
+        system_message="You are a podcast host explaining research papers in an engaging, conversational way."
+    ).with_model("openai", "gpt-4o-mini")
+    
+    podcast_prompt = f"""Create an engaging 3-minute podcast script explaining this research paper.
+
+Key Points:
+Problem: {key_points_data.get('problem', '')}
+Main Idea: {key_points_data.get('main_idea', '')}
+Approach: {key_points_data.get('approach', '')}
+Results: {key_points_data.get('results', '')}
+
+Make it conversational, engaging, and accessible to a general audience. Use storytelling and real-world examples."""
+    
+    podcast_script = await podcast_chat.send_message(UserMessage(text=podcast_prompt))
+    
+    # Generate PPT outline
+    ppt_chat = LlmChat(
+        api_key=llm_key,
+        session_id=f"ppt_{uuid.uuid4()}",
+        system_message="You are a presentation expert creating clear, visual slide outlines."
+    ).with_model("openai", "gpt-4o-mini")
+    
+    ppt_prompt = f"""Create a 5-slide presentation outline for this research paper:
+
+Problem: {key_points_data.get('problem', '')}
+Main Idea: {key_points_data.get('main_idea', '')}
+Approach: {key_points_data.get('approach', '')}
+Results: {key_points_data.get('results', '')}
+
+For each slide provide:
+1. Slide title
+2. 3-5 bullet points
+3. Visual suggestion
+
+Return as JSON array: [{{"slide": 1, "title": "...", "bullets": ["..."], "visual": "..."}}]"""
+    
+    ppt_response = await ppt_chat.send_message(UserMessage(text=ppt_prompt))
+    
+    try:
+        json_match = re.search(r'\[\s*\{[^\[\]]*"slide"[^\[\]]*\}\s*(?:,\s*\{[^\[\]]*"slide"[^\[\]]*\}\s*)*\]', ppt_response, re.DOTALL)
+        if json_match:
+            ppt_data = json.loads(json_match.group())
+        else:
+            ppt_data = json.loads(ppt_response)
+    except Exception as e:
+        logging.error(f"Error parsing PPT JSON: {e}")
+        ppt_data = [{"slide": 1, "title": "Overview", "bullets": ["Main points"], "visual": "Diagram"}]
     
     return {
         "key_points": key_points_data,
@@ -228,7 +299,9 @@ Return as JSON array: [{"term": "...", "definition": "..."}]"""
         "student_explanation": student_explanation,
         "researcher_explanation": researcher_explanation,
         "glossary": glossary_data,
-        "evidence_chunks": [c.chunk_id for c in chunks[:5]]
+        "evidence_chunks": [c.chunk_id for c in chunks[:5]],
+        "podcast_script": podcast_script,
+        "ppt_slides": ppt_data
     }
 
 # API Routes
@@ -314,6 +387,8 @@ async def analyze_paper(paper_id: str):
             "researcher_explanation": analysis["researcher_explanation"],
             "glossary": analysis["glossary"],
             "evidence_chunks": analysis["evidence_chunks"],
+            "podcast_script": analysis["podcast_script"],
+            "ppt_slides": analysis["ppt_slides"],
             "created_at": datetime.now(timezone.utc).isoformat()
         }
         
